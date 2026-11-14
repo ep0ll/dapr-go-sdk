@@ -20,6 +20,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -69,11 +71,66 @@ type Job struct {
 	DueTime       *string
 	TTL           *string
 	Data          *anypb.Any
-	FailurePolicy FailurePolicy
-	Overwrite     bool
+	FailurePolicy     FailurePolicy
+	OverrideRoutePath string
+	Overwrite         bool
 }
 
 type JobOption func(*Job)
+
+// jobOverrideRoutePathFieldNumber is the stable protobuf field number for
+// Job.override_route_path. The Dapr protobuf module is versioned separately
+// from this SDK, so wire encoding keeps this option usable with older module
+// versions that do not expose the generated field yet.
+const jobOverrideRoutePathFieldNumber protowire.Number = 8
+
+func setJobOverrideRoutePath(job *runtimepb.Job, routePath string) {
+	if field := job.ProtoReflect().Descriptor().Fields().ByNumber(jobOverrideRoutePathFieldNumber); field != nil {
+		job.ProtoReflect().Set(field, protoreflect.ValueOfString(routePath))
+		return
+	}
+
+	unknown := job.ProtoReflect().GetUnknown()
+	unknown = protowire.AppendTag(unknown, jobOverrideRoutePathFieldNumber, protowire.BytesType)
+	unknown = protowire.AppendString(unknown, routePath)
+	job.ProtoReflect().SetUnknown(unknown)
+}
+
+func getJobOverrideRoutePath(job *runtimepb.Job) string {
+	if field := job.ProtoReflect().Descriptor().Fields().ByNumber(jobOverrideRoutePathFieldNumber); field != nil {
+		return job.ProtoReflect().Get(field).String()
+	}
+
+	var routePath string
+	unknown := job.ProtoReflect().GetUnknown()
+	for len(unknown) > 0 {
+		number, wireType, tagLength := protowire.ConsumeTag(unknown)
+		if tagLength < 0 {
+			return routePath
+		}
+		unknown = unknown[tagLength:]
+
+		if wireType == protowire.BytesType {
+			value, valueLength := protowire.ConsumeString(unknown)
+			if valueLength < 0 {
+				return routePath
+			}
+			if number == jobOverrideRoutePathFieldNumber {
+				routePath = value
+			}
+			unknown = unknown[valueLength:]
+			continue
+		}
+
+		valueLength := protowire.ConsumeFieldValue(number, wireType, unknown)
+		if valueLength < 0 {
+			return routePath
+		}
+		unknown = unknown[valueLength:]
+	}
+
+	return routePath
+}
 
 func NewJob(name string, opts ...JobOption) *Job {
 	job := &Job{
@@ -112,6 +169,14 @@ func WithJobTTL(ttl string) JobOption {
 func WithJobData(data *anypb.Any) JobOption {
 	return func(job *Job) {
 		job.Data = data
+	}
+}
+
+// WithJobOverrideRoutePath sets the optional relative HTTP path used to deliver
+// the job to the application. When unset, Dapr routes to /job/{job name}.
+func WithJobOverrideRoutePath(routePath string) JobOption {
+	return func(job *Job) {
+		job.OverrideRoutePath = routePath
 	}
 }
 
@@ -172,6 +237,9 @@ func (c *GRPCClient) ScheduleJob(ctx context.Context, job *Job) error {
 		DueTime:  job.DueTime,
 		Ttl:      job.TTL,
 	}
+	if job.OverrideRoutePath != "" {
+		setJobOverrideRoutePath(jobRequest, job.OverrideRoutePath)
+	}
 
 	if job.FailurePolicy != nil {
 		jobRequest.FailurePolicy = job.FailurePolicy.GetPBFailurePolicy()
@@ -230,8 +298,9 @@ func (c *GRPCClient) GetJob(ctx context.Context, name string) (*Job, error) {
 		Repeats:       ptr.Of(resp.GetJob().GetRepeats()),
 		DueTime:       ptr.Of(resp.GetJob().GetDueTime()),
 		TTL:           ptr.Of(resp.GetJob().GetTtl()),
-		Data:          resp.GetJob().GetData(),
-		FailurePolicy: failurePolicy,
+		Data:              resp.GetJob().GetData(),
+		FailurePolicy:     failurePolicy,
+		OverrideRoutePath: getJobOverrideRoutePath(resp.GetJob()),
 	}, nil
 }
 
