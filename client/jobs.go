@@ -111,12 +111,12 @@ func getJobOverrideRoutePath(job *runtimepb.Job) string {
 		unknown = unknown[tagLength:]
 
 		if wireType == protowire.BytesType {
-			value, valueLength := protowire.ConsumeString(unknown)
+			value, valueLength := protowire.ConsumeBytes(unknown)
 			if valueLength < 0 {
 				return routePath
 			}
 			if number == jobOverrideRoutePathFieldNumber {
-				routePath = value
+				routePath = string(value)
 			}
 			unknown = unknown[valueLength:]
 			continue
