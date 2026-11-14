@@ -47,6 +47,8 @@ type TopicEvent struct {
 	Topic string `json:"topic"`
 	// PubsubName is name of the pub/sub this message came from
 	PubsubName string `json:"pubsubname"`
+	// Extensions are custom CloudEvent attributes.
+	Extensions map[string]interface{} `json:"-" `
 	// Metadata is the custom metadata attached to the event.
 	Metadata map[string]string `json:"metadata,omitempty"`
 	// TraceID is the tracing header identifier for the incoming event

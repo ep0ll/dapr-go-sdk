@@ -220,11 +220,15 @@ func (s *Subscription) Receive() (*SubscriptionMessage, error) {
 }
 
 func topicEventFromSingle(event *pb.TopicEventRequest) *common.TopicEvent {
+	var extensions map[string]interface{}
+	if event.GetExtensions() != nil {
+		extensions = event.GetExtensions().AsMap()
+	}
 	return &common.TopicEvent{
 		ID: event.GetId(), Source: event.GetSource(), Type: event.GetType(),
 		SpecVersion: event.GetSpecVersion(), DataContentType: event.GetDataContentType(),
 		Data: decodeSubscriptionData(event.GetData(), event.GetDataContentType()), RawData: event.GetData(),
-		Topic: event.GetTopic(), PubsubName: event.GetPubsubName(),
+		Topic: event.GetTopic(), PubsubName: event.GetPubsubName(), Extensions: extensions,
 	}
 }
 
@@ -234,12 +238,17 @@ func topicEventFromBulk(event *pb.TopicEventBulkRequestEntry, opts SubscriptionO
 	}
 	if cloudEvent := event.GetCloudEvent(); cloudEvent != nil {
 		data := cloudEvent.GetData()
+		var extensions map[string]interface{}
+		if cloudEvent.GetExtensions() != nil {
+			extensions = cloudEvent.GetExtensions().AsMap()
+		}
 		return &common.TopicEvent{
 			ID: cloudEvent.GetId(), EntryID: event.GetEntryId(), Source: cloudEvent.GetSource(),
 			Type: cloudEvent.GetType(), SpecVersion: cloudEvent.GetSpecVersion(),
 			DataContentType: cloudEvent.GetDataContentType(),
 			Data: decodeSubscriptionData(data, cloudEvent.GetDataContentType()), RawData: data,
 			Topic: opts.Topic, PubsubName: opts.PubsubName, Metadata: event.GetMetadata(),
+			Extensions: extensions,
 		}, nil
 	}
 	if data := event.GetBytes(); data != nil {
