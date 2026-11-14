@@ -42,8 +42,12 @@ func (d *DaprStateAsyncProvider) ContainsContext(ctx context.Context, actorType 
 		ActorID:   actorID,
 		KeyName:   stateName,
 	})
-	if err != nil || result == nil {
+	if err != nil {
 		return false, err
+	}
+	if result == nil {
+		d.rememberETag(actorType, actorID, stateName, "")
+		return false, nil
 	}
 	d.rememberETag(actorType, actorID, stateName, result.ETag)
 	return len(result.Data) > 0, nil
@@ -64,6 +68,7 @@ func (d *DaprStateAsyncProvider) LoadContext(ctx context.Context, actorType, act
 		return fmt.Errorf("get actor state error = %w", err)
 	}
 	if result == nil {
+		d.rememberETag(actorType, actorID, stateName, "")
 		return fmt.Errorf("get actor state result is nil, with actorType: %s, actorID: %s, stateName %s", actorType, actorID, stateName)
 	}
 	d.rememberETag(actorType, actorID, stateName, result.ETag)
@@ -87,7 +92,6 @@ func (d *DaprStateAsyncProvider) ApplyContext(ctx context.Context, actorType, ac
 	}
 
 	operations := make([]*client.ActorStateOperation, 0)
-	var value []byte
 	for _, stateChange := range changes {
 		if stateChange == nil {
 			continue
