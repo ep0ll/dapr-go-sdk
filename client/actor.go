@@ -20,6 +20,8 @@ import (
 	"reflect"
 	"strconv"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
@@ -414,6 +416,7 @@ type GetActorStateRequest struct {
 
 type GetActorStateResponse struct {
 	Data []byte
+	ETag string
 }
 
 func (c *GRPCClient) GetActorState(ctx context.Context, in *GetActorStateRequest) (*GetActorStateResponse, error) {
@@ -437,7 +440,7 @@ func (c *GRPCClient) GetActorState(ctx context.Context, in *GetActorStateRequest
 	if err != nil {
 		return nil, fmt.Errorf("error invoking actor get state %s/%s: %w", in.ActorType, in.ActorID, err)
 	}
-	return &GetActorStateResponse{Data: rsp.GetData()}, nil
+	return &GetActorStateResponse{Data: rsp.GetData(), ETag: rsp.GetEtag()}, nil
 }
 
 type ActorStateOperation struct {
@@ -445,6 +448,7 @@ type ActorStateOperation struct {
 	Key           string
 	Value         []byte
 	TTLInSeconds  *int64
+	ETag          string
 }
 
 func (c *GRPCClient) SaveStateTransactionally(ctx context.Context, actorType, actorID string, operations []*ActorStateOperation) error {
@@ -471,6 +475,7 @@ func (c *GRPCClient) SaveStateTransactionally(ctx context.Context, actorType, ac
 				Value: op.Value,
 			},
 			Metadata: metadata,
+			Etag:     op.ETag,
 		})
 	}
 	_, err := c.protoClient.ExecuteActorStateTransaction(ctx, &pb.ExecuteActorStateTransactionRequest{
@@ -478,5 +483,8 @@ func (c *GRPCClient) SaveStateTransactionally(ctx context.Context, actorType, ac
 		ActorId:    actorID,
 		Operations: grpcOperations,
 	})
+	if status.Code(err) == codes.Aborted {
+		return &ActorStateETagMismatchError{ActorType: actorType, ActorID: actorID, Err: err}
+	}
 	return err
 }
