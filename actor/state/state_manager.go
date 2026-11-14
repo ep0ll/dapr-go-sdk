@@ -126,15 +126,17 @@ func (s *stateManagerCtx) Get(ctx context.Context, stateName string, reply any) 
 		return nil
 	}
 
-	err := s.stateAsyncProvider.LoadContext(ctx, s.actorTypeName, s.actorID, stateName, reply)
+	if err := s.stateAsyncProvider.LoadContext(ctx, s.actorTypeName, s.actorID, stateName, reply); err != nil {
+		return err
+	}
 	s.stateChangeTracker.Store(stateName, &ChangeMetadata{
 		Kind:  None,
 		Value: reply,
 	})
-	return err
+	return nil
 }
 
-func (s *stateManagerCtx) Set(_ context.Context, stateName string, value any) error {
+func (s *stateManagerCtx) Set(ctx context.Context, stateName string, value any) error {
 	if stateName == "" {
 		return errors.New("state name can't be empty")
 	}
@@ -146,14 +148,23 @@ func (s *stateManagerCtx) Set(_ context.Context, stateName string, value any) er
 		s.stateChangeTracker.Store(stateName, NewChangeMetadata(metadata.Kind, value))
 		return nil
 	}
+
+	exists, err := s.stateAsyncProvider.ContainsContext(ctx, s.actorTypeName, s.actorID, stateName)
+	if err != nil {
+		return err
+	}
+	kind := Add
+	if exists {
+		kind = Update
+	}
 	s.stateChangeTracker.Store(stateName, &ChangeMetadata{
-		Kind:  Add,
+		Kind:  kind,
 		Value: value,
 	})
 	return nil
 }
 
-func (s *stateManagerCtx) SetWithTTL(_ context.Context, stateName string, value any, ttl time.Duration) error {
+func (s *stateManagerCtx) SetWithTTL(ctx context.Context, stateName string, value any, ttl time.Duration) error {
 	if stateName == "" {
 		return errors.New("state name can't be empty")
 	}
@@ -170,8 +181,16 @@ func (s *stateManagerCtx) SetWithTTL(_ context.Context, stateName string, value 
 		s.stateChangeTracker.Store(stateName, NewChangeMetadata(metadata.Kind, value))
 		return nil
 	}
+	exists, err := s.stateAsyncProvider.ContainsContext(ctx, s.actorTypeName, s.actorID, stateName)
+	if err != nil {
+		return err
+	}
+	kind := Add
+	if exists {
+		kind = Update
+	}
 	s.stateChangeTracker.Store(stateName, (&ChangeMetadata{
-		Kind:  Add,
+		Kind:  kind,
 		Value: value,
 	}).WithTTL(ttl))
 	return nil
@@ -197,7 +216,11 @@ func (s *stateManagerCtx) Remove(ctx context.Context, stateName string) error {
 		})
 		return nil
 	}
-	if exist, err := s.stateAsyncProvider.ContainsContext(ctx, s.actorTypeName, s.actorID, stateName); err != nil && exist {
+	exists, err := s.stateAsyncProvider.ContainsContext(ctx, s.actorTypeName, s.actorID, stateName)
+	if err != nil {
+		return err
+	}
+	if exists {
 		s.stateChangeTracker.Store(stateName, &ChangeMetadata{
 			Kind:  Remove,
 			Value: nil,
@@ -236,17 +259,9 @@ func (s *stateManagerCtx) Save(ctx context.Context) error {
 }
 
 func (s *stateManagerCtx) Flush(_ context.Context) {
-	s.stateChangeTracker.Range(func(key, value any) bool {
-		stateName := key.(string)
-		metadata := value.(*ChangeMetadata)
-		if metadata.Kind == Remove {
-			s.stateChangeTracker.Delete(stateName)
-			return true
-		}
-		metadata = NewChangeMetadata(None, metadata.Value)
-		s.stateChangeTracker.Store(stateName, metadata)
-		return true
-	})
+	// Successful state transactions change row versions. Drop cached values so
+	// the next read reloads both the value and the matching ETag.
+	s.stateChangeTracker = sync.Map{}
 }
 
 // Deprecated: use NewActorStateManagerContext instead.
