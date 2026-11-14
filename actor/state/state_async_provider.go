@@ -16,6 +16,7 @@ package state
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/dapr/go-sdk/actor/codec"
 	"github.com/dapr/go-sdk/actor/codec/constant"
@@ -25,6 +26,9 @@ import (
 type DaprStateAsyncProvider struct {
 	daprClient      client.Client
 	stateSerializer codec.Codec
+
+	etagMu sync.RWMutex
+	etags  map[string]string
 }
 
 // Deprecated: use ContainsContext instead.
@@ -41,7 +45,8 @@ func (d *DaprStateAsyncProvider) ContainsContext(ctx context.Context, actorType 
 	if err != nil || result == nil {
 		return false, err
 	}
-	return len(result.Data) > 0, err
+	d.rememberETag(actorType, actorID, stateName, result.ETag)
+	return len(result.Data) > 0, nil
 }
 
 // Deprecated: use LoadContext instead.
@@ -58,6 +63,10 @@ func (d *DaprStateAsyncProvider) LoadContext(ctx context.Context, actorType, act
 	if err != nil {
 		return fmt.Errorf("get actor state error = %w", err)
 	}
+	if result == nil {
+		return fmt.Errorf("get actor state result is nil, with actorType: %s, actorID: %s, stateName %s", actorType, actorID, stateName)
+	}
+	d.rememberETag(actorType, actorID, stateName, result.ETag)
 	if len(result.Data) == 0 {
 		return fmt.Errorf("get actor state result empty, with actorType: %s, actorID: %s, stateName %s", actorType, actorID, stateName)
 	}
@@ -89,18 +98,20 @@ func (d *DaprStateAsyncProvider) ApplyContext(ctx context.Context, actorType, ac
 			continue
 		}
 
-		if stateChange.changeKind == Add {
+		var operationValue []byte
+		if stateChange.changeKind == Add || stateChange.changeKind == Update {
 			data, err := d.stateSerializer.Marshal(stateChange.value)
 			if err != nil {
 				return err
 			}
-			value = data
+			operationValue = data
 		}
 		operations = append(operations, &client.ActorStateOperation{
 			OperationType: daprOperationName,
 			Key:           stateChange.stateName,
-			Value:         value,
+			Value:         operationValue,
 			TTLInSeconds:  stateChange.ttlInSeconds,
+			ETag:          d.getETag(actorType, actorID, stateChange.stateName),
 		})
 	}
 
@@ -108,7 +119,45 @@ func (d *DaprStateAsyncProvider) ApplyContext(ctx context.Context, actorType, ac
 		return nil
 	}
 
-	return d.daprClient.SaveStateTransactionally(ctx, actorType, actorID, operations)
+	if err := d.daprClient.SaveStateTransactionally(ctx, actorType, actorID, operations); err != nil {
+		return err
+	}
+	for _, change := range changes {
+		if change != nil {
+			d.deleteETag(actorType, actorID, change.stateName)
+		}
+	}
+	return nil
+}
+
+func (d *DaprStateAsyncProvider) etagKey(actorType, actorID, stateName string) string {
+	return fmt.Sprintf("%d:%s%d:%s%s", len(actorType), actorType, len(actorID), actorID, stateName)
+}
+
+func (d *DaprStateAsyncProvider) rememberETag(actorType, actorID, stateName, etag string) {
+	key := d.etagKey(actorType, actorID, stateName)
+	d.etagMu.Lock()
+	defer d.etagMu.Unlock()
+	if etag == "" {
+		delete(d.etags, key)
+		return
+	}
+	if d.etags == nil {
+		d.etags = make(map[string]string)
+	}
+	d.etags[key] = etag
+}
+
+func (d *DaprStateAsyncProvider) getETag(actorType, actorID, stateName string) string {
+	d.etagMu.RLock()
+	defer d.etagMu.RUnlock()
+	return d.etags[d.etagKey(actorType, actorID, stateName)]
+}
+
+func (d *DaprStateAsyncProvider) deleteETag(actorType, actorID, stateName string) {
+	d.etagMu.Lock()
+	delete(d.etags, d.etagKey(actorType, actorID, stateName))
+	d.etagMu.Unlock()
 }
 
 // TODO(@laurence) the daprClient may be nil.
