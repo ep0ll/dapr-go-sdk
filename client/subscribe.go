@@ -157,6 +157,9 @@ func (s *Subscription) Receive() (*SubscriptionMessage, error) {
 			switch st.Code() {
 			case codes.Unavailable, codes.Unknown:
 				logger.Printf("gRPC error while reading from stream: %s (code=%v)", st.Message(), st.Code())
+				// Any buffered entries belong to the stream that just failed.
+				// They must not be delivered (or acknowledged) on its replacement.
+				s.pending = nil
 				if s.closed.Load() {
 					return nil, errors.New("subscription is permanently closed; cannot reconnect")
 				}
