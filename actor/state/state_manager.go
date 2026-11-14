@@ -261,7 +261,10 @@ func (s *stateManagerCtx) Save(ctx context.Context) error {
 func (s *stateManagerCtx) Flush(_ context.Context) {
 	// Successful state transactions change row versions. Drop cached values so
 	// the next read reloads both the value and the matching ETag.
-	s.stateChangeTracker = sync.Map{}
+	s.stateChangeTracker.Range(func(key, _ any) bool {
+		s.stateChangeTracker.Delete(key)
+		return true
+	})
 }
 
 // Deprecated: use NewActorStateManagerContext instead.
