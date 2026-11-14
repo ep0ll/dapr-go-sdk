@@ -33,3 +33,6 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
 )
+
+// Use the matching runtime branch until the streaming bulk protocol is merged and released.
+replace github.com/dapr/dapr => github.com/ep0ll/dapr v1.20.0-0.20261114160128-3fcea812d93d

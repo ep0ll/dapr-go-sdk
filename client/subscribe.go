@@ -32,16 +32,26 @@ import (
 
 type SubscriptionHandleFunction func(event *common.TopicEvent) common.SubscriptionResponseStatus
 
+// BulkSubscribeOptions configures batched delivery for a streaming subscription.
+type BulkSubscribeOptions struct {
+	Enabled            bool
+	MaxMessagesCount   int32
+	MaxAwaitDurationMs int32
+}
+
 type SubscriptionOptions struct {
 	PubsubName      string
 	Topic           string
 	DeadLetterTopic *string
 	Metadata        map[string]string
+	BulkSubscribe   *BulkSubscribeOptions
 }
 
 type Subscription struct {
-	ctx    context.Context
-	stream pb.Dapr_SubscribeTopicEventsAlpha1Client
+	ctx        context.Context
+	stream     pb.Dapr_SubscribeTopicEventsAlpha1Client
+	pending    []*SubscriptionMessage
+	generation uint64
 
 	// lock locks concurrent writes to subscription stream.
 	lock   sync.Mutex
@@ -53,7 +63,9 @@ type Subscription struct {
 
 type SubscriptionMessage struct {
 	*common.TopicEvent
-	sub *Subscription
+	sub              *Subscription
+	ackID            string
+	streamGeneration uint64
 }
 
 func (c *GRPCClient) Subscribe(ctx context.Context, opts SubscriptionOptions) (*Subscription, error) {
@@ -112,8 +124,23 @@ func (s *Subscription) Close() error {
 }
 
 func (s *Subscription) Receive() (*SubscriptionMessage, error) {
+	if len(s.pending) > 0 {
+		message := s.pending[0]
+		s.pending[0] = nil
+		s.pending = s.pending[1:]
+		return message, nil
+	}
+
 	for {
-		resp, err := s.stream.Recv()
+		s.lock.Lock()
+		stream := s.stream
+		generation := s.generation
+		s.lock.Unlock()
+		if stream == nil {
+			return nil, errors.New("subscription stream is not initialized")
+		}
+
+		resp, err := stream.Recv()
 		if err != nil {
 			select {
 			case <-s.ctx.Done():
@@ -124,15 +151,12 @@ func (s *Subscription) Receive() (*SubscriptionMessage, error) {
 
 			st, ok := status.FromError(err)
 			if !ok {
-				// not a grpc status error
 				return nil, err
 			}
 
 			switch st.Code() {
 			case codes.Unavailable, codes.Unknown:
-				logger.Printf("gRPC error while reading from stream: %s (code=%v)",
-					st.Message(), st.Code())
-				// close the current stream and reconnect
+				logger.Printf("gRPC error while reading from stream: %s (code=%v)", st.Message(), st.Code())
 				if s.closed.Load() {
 					return nil, errors.New("subscription is permanently closed; cannot reconnect")
 				}
@@ -142,66 +166,115 @@ func (s *Subscription) Receive() (*SubscriptionMessage, error) {
 
 				newStream, nerr := s.createStream(s.ctx, s.opts)
 				if nerr != nil {
-					return nil, errors.New("re-subscribe failed")
+					return nil, fmt.Errorf("re-subscribe failed: %w", nerr)
 				}
 
 				s.lock.Lock()
 				s.stream = newStream
+				s.generation++
 				s.lock.Unlock()
-
-				// try receiving again
 				continue
 
 			case codes.Canceled:
 				return nil, errors.New("stream canceled")
-
 			default:
-				return nil, errors.New("subscription recv error")
+				return nil, fmt.Errorf("subscription recv error: %w", err)
 			}
 		}
 
-		event := resp.GetEventMessage()
-		data := any(event.GetData())
-		if len(event.GetData()) > 0 {
-			mediaType, _, err := mime.ParseMediaType(event.GetDataContentType())
-			if err == nil {
-				var v interface{}
-				switch mediaType {
-				case "application/json":
-					if err := json.Unmarshal(event.GetData(), &v); err == nil {
-						data = v
-					}
-				case "text/plain":
-					// Assume UTF-8 encoded string.
-					data = string(event.GetData())
-				default:
-					if strings.HasPrefix(mediaType, "application/") &&
-						strings.HasSuffix(mediaType, "+json") {
-						if err := json.Unmarshal(event.GetData(), &v); err == nil {
-							data = v
-						}
-					}
+		if event := resp.GetEventMessage(); event != nil {
+			if len(resp.GetEventMessages()) > 0 {
+				return nil, errors.New("streaming response contains both a single event and bulk events")
+			}
+			return &SubscriptionMessage{
+				sub: s, TopicEvent: topicEventFromSingle(event), ackID: event.GetId(), streamGeneration: generation,
+			}, nil
+		}
+
+		if events := resp.GetEventMessages(); len(events) > 0 {
+			messages := make([]*SubscriptionMessage, 0, len(events))
+			for _, event := range events {
+				if event == nil || event.GetEntry() == nil || event.GetDeliveryId() == "" {
+					return nil, errors.New("streaming bulk response contains an invalid entry or empty delivery ID")
 				}
+				topicEvent, err := topicEventFromBulk(event.GetEntry(), s.opts)
+				if err != nil {
+					return nil, err
+				}
+				messages = append(messages, &SubscriptionMessage{
+					sub: s, TopicEvent: topicEvent, ackID: event.GetDeliveryId(), streamGeneration: generation,
+				})
 			}
+			s.pending = append(s.pending, messages[1:]...)
+			return messages[0], nil
 		}
 
-		topicEvent := &common.TopicEvent{
-			ID:              event.GetId(),
-			Source:          event.GetSource(),
-			Type:            event.GetType(),
-			SpecVersion:     event.GetSpecVersion(),
-			DataContentType: event.GetDataContentType(),
-			Data:            data,
-			RawData:         event.GetData(),
-			Topic:           event.GetTopic(),
-			PubsubName:      event.GetPubsubName(),
+		if resp.GetInitialResponse() != nil {
+			continue
 		}
+		return nil, errors.New("streaming response contains no event")
+	}
+}
 
-		return &SubscriptionMessage{
-			sub:        s,
-			TopicEvent: topicEvent,
+func topicEventFromSingle(event *pb.TopicEventRequest) *common.TopicEvent {
+	return &common.TopicEvent{
+		ID: event.GetId(), Source: event.GetSource(), Type: event.GetType(),
+		SpecVersion: event.GetSpecVersion(), DataContentType: event.GetDataContentType(),
+		Data: decodeSubscriptionData(event.GetData(), event.GetDataContentType()), RawData: event.GetData(),
+		Topic: event.GetTopic(), PubsubName: event.GetPubsubName(),
+	}
+}
+
+func topicEventFromBulk(event *pb.TopicEventBulkRequestEntry, opts SubscriptionOptions) (*common.TopicEvent, error) {
+	if event == nil {
+		return nil, errors.New("streaming bulk entry is nil")
+	}
+	if cloudEvent := event.GetCloudEvent(); cloudEvent != nil {
+		data := cloudEvent.GetData()
+		return &common.TopicEvent{
+			ID: cloudEvent.GetId(), EntryID: event.GetEntryId(), Source: cloudEvent.GetSource(),
+			Type: cloudEvent.GetType(), SpecVersion: cloudEvent.GetSpecVersion(),
+			DataContentType: cloudEvent.GetDataContentType(),
+			Data: decodeSubscriptionData(data, cloudEvent.GetDataContentType()), RawData: data,
+			Topic: opts.Topic, PubsubName: opts.PubsubName, Metadata: event.GetMetadata(),
 		}, nil
 	}
+	if data := event.GetBytes(); data != nil {
+		return &common.TopicEvent{
+			ID: event.GetEntryId(), EntryID: event.GetEntryId(),
+			DataContentType: event.GetContentType(),
+			Data: decodeSubscriptionData(data, event.GetContentType()), RawData: data,
+			Topic: opts.Topic, PubsubName: opts.PubsubName, Metadata: event.GetMetadata(),
+		}, nil
+	}
+	return nil, fmt.Errorf("streaming bulk entry %q has no event payload", event.GetEntryId())
+}
+
+func decodeSubscriptionData(data []byte, contentType string) any {
+	value := any(data)
+	if len(data) == 0 {
+		return value
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return value
+	}
+	var decoded any
+	switch mediaType {
+	case "application/json":
+		if json.Unmarshal(data, &decoded) == nil {
+			return decoded
+		}
+	case "text/plain":
+		return string(data)
+	default:
+		if strings.HasPrefix(mediaType, "application/") && strings.HasSuffix(mediaType, "+json") {
+			if json.Unmarshal(data, &decoded) == nil {
+				return decoded
+			}
+		}
+	}
+	return value
 }
 
 func (s *SubscriptionMessage) Success() error {
@@ -238,14 +311,27 @@ func (s *SubscriptionMessage) respond(status pb.TopicEventResponse_TopicEventRes
 	s.sub.lock.Lock()
 	defer s.sub.lock.Unlock()
 
+	if s.streamGeneration != s.sub.generation {
+		return errors.New("cannot acknowledge a message received on a replaced subscription stream")
+	}
 	return s.sub.stream.Send(&pb.SubscribeTopicEventsRequestAlpha1{
 		SubscribeTopicEventsRequestType: &pb.SubscribeTopicEventsRequestAlpha1_EventProcessed{
 			EventProcessed: &pb.SubscribeTopicEventsRequestProcessedAlpha1{
-				Id:     s.ID,
+				Id: s.ackID,
 				Status: &pb.TopicEventResponse{Status: status},
 			},
 		},
 	})
+}
+
+func bulkSubscribeConfig(opts *BulkSubscribeOptions) *pb.BulkSubscribeConfig {
+	if opts == nil {
+		return nil
+	}
+	return &pb.BulkSubscribeConfig{
+		Enabled: opts.Enabled, MaxMessagesCount: opts.MaxMessagesCount,
+		MaxAwaitDurationMs: opts.MaxAwaitDurationMs,
+	}
 }
 
 func (c *GRPCClient) subscribeInitialRequest(ctx context.Context, opts SubscriptionOptions) (pb.Dapr_SubscribeTopicEventsAlpha1Client, error) {
@@ -267,6 +353,7 @@ func (c *GRPCClient) subscribeInitialRequest(ctx context.Context, opts Subscript
 			InitialRequest: &pb.SubscribeTopicEventsRequestInitialAlpha1{
 				PubsubName: opts.PubsubName, Topic: opts.Topic,
 				Metadata: opts.Metadata, DeadLetterTopic: opts.DeadLetterTopic,
+				BulkSubscribe: bulkSubscribeConfig(opts.BulkSubscribe),
 			},
 		},
 	})

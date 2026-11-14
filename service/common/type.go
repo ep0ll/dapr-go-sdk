@@ -19,8 +19,10 @@ import (
 
 // TopicEvent is the content of the inbound topic message.
 type TopicEvent struct {
-	// ID identifies the event.
+	// ID identifies the CloudEvent, or the component entry for raw payload messages.
 	ID string `json:"id"`
+	// EntryID identifies the component bulk entry for streaming bulk messages.
+	EntryID string `json:"entryId,omitempty"`
 	// The version of the CloudEvents specification.
 	SpecVersion string `json:"specversion"`
 	// The type of event related to the originating occurrence.
